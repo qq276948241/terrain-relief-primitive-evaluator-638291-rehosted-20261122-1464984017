@@ -1,9 +1,9 @@
 package primitive
 
 import (
+	"context"
 	"image"
 	"math/rand"
-	"time"
 
 	"github.com/golang/freetype/raster"
 )
@@ -18,6 +18,7 @@ type Worker struct {
 	Heatmap    *Heatmap
 	Rnd        *rand.Rand
 	Score      float64
+	Total      uint64
 	Counter    int
 }
 
@@ -32,13 +33,24 @@ func NewWorker(target *image.RGBA) *Worker {
 	worker.Rasterizer = raster.NewRasterizer(w, h)
 	worker.Lines = make([]Scanline, 0, 4096) // TODO: based on height
 	worker.Heatmap = NewHeatmap(w, h)
-	worker.Rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// A worker never owns a long-lived random stream; the model installs a
+	// per-job source with SetRand before every search job. The seed here is
+	// only a deterministic placeholder.
+	worker.Rnd = rand.New(rand.NewSource(0))
 	return &worker
 }
 
-func (worker *Worker) Init(current *image.RGBA, score float64) {
+// SetRand installs the random source for the next job. It must only be
+// called by the goroutine that currently owns the worker, so the mutable
+// rand state is never shared between goroutines.
+func (worker *Worker) SetRand(rnd *rand.Rand) {
+	worker.Rnd = rnd
+}
+
+func (worker *Worker) Init(current *image.RGBA, total uint64) {
 	worker.Current = current
-	worker.Score = score
+	worker.Total = total
+	worker.Score = totalToScore(total, worker.W, worker.H)
 	worker.Counter = 0
 	worker.Heatmap.Clear()
 }
@@ -50,38 +62,56 @@ func (worker *Worker) Energy(shape Shape, alpha int) float64 {
 	color := computeColor(worker.Target, worker.Current, lines, alpha)
 	copyLines(worker.Buffer, worker.Current, lines)
 	drawLines(worker.Buffer, color, lines)
-	return differencePartial(worker.Target, worker.Current, worker.Buffer, worker.Score, lines)
+	total := differencePartialTotal(worker.Target, worker.Current, worker.Buffer, worker.Total, lines)
+	return totalToScore(total, worker.W, worker.H)
 }
 
-func (worker *Worker) BestHillClimbState(t ShapeType, a, n, age, m int) *State {
+func (worker *Worker) BestHillClimbState(ctx context.Context, t ShapeType, a, n, age, m int) (*State, error) {
 	var bestEnergy float64
+	var bestKey string
 	var bestState *State
 	for i := 0; i < m; i++ {
-		state := worker.BestRandomState(t, a, n)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		state, err := worker.BestRandomState(ctx, t, a, n)
+		if err != nil {
+			return nil, err
+		}
 		before := state.Energy()
-		state = HillClimb(state, age).(*State)
-		energy := state.Energy()
+		climbed, err := HillClimbContext(ctx, state, age)
+		if err != nil {
+			return nil, err
+		}
+		finalState := climbed.(*State)
+		energy := finalState.Energy()
 		vv("%dx random: %.6f -> %dx hill climb: %.6f\n", n, before, age, energy)
-		if i == 0 || energy < bestEnergy {
+		if bestState == nil || betterCandidate(energy, stateKey(finalState.Shape), bestEnergy, bestKey) {
 			bestEnergy = energy
-			bestState = state
+			bestKey = stateKey(finalState.Shape)
+			bestState = finalState
 		}
 	}
-	return bestState
+	return bestState, nil
 }
 
-func (worker *Worker) BestRandomState(t ShapeType, a, n int) *State {
+func (worker *Worker) BestRandomState(ctx context.Context, t ShapeType, a, n int) (*State, error) {
 	var bestEnergy float64
+	var bestKey string
 	var bestState *State
 	for i := 0; i < n; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		state := worker.RandomState(t, a)
 		energy := state.Energy()
-		if i == 0 || energy < bestEnergy {
+		if bestState == nil || betterCandidate(energy, stateKey(state.Shape), bestEnergy, bestKey) {
 			bestEnergy = energy
+			bestKey = stateKey(state.Shape)
 			bestState = state
 		}
 	}
-	return bestState
+	return bestState, nil
 }
 
 func (worker *Worker) RandomState(t ShapeType, a int) *State {

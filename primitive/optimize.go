@@ -1,6 +1,7 @@
 package primitive
 
 import (
+	"context"
 	"math"
 	"math/rand"
 )
@@ -13,11 +14,22 @@ type Annealable interface {
 }
 
 func HillClimb(state Annealable, maxAge int) Annealable {
+	result, _ := HillClimbContext(context.Background(), state, maxAge)
+	return result
+}
+
+// HillClimbContext is HillClimb with cancellation: the context is checked
+// before every move so a cancelled search stops promptly instead of running
+// to maxAge.
+func HillClimbContext(ctx context.Context, state Annealable, maxAge int) (Annealable, error) {
 	state = state.Copy()
 	bestState := state.Copy()
 	bestEnergy := state.Energy()
 	step := 0
 	for age := 0; age < maxAge; age++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		undo := state.DoMove()
 		energy := state.Energy()
 		if energy >= bestEnergy {
@@ -30,7 +42,7 @@ func HillClimb(state Annealable, maxAge int) Annealable {
 		}
 		step++
 	}
-	return bestState
+	return bestState, nil
 }
 
 func PreAnneal(state Annealable, iterations int) float64 {
@@ -46,7 +58,10 @@ func PreAnneal(state Annealable, iterations int) float64 {
 	return total / float64(iterations)
 }
 
-func Anneal(state Annealable, maxTemp, minTemp float64, steps int) Annealable {
+// Anneal runs simulated annealing. The random source is passed explicitly
+// (rnd) so concurrent anneals never share mutable rand state through the
+// global math/rand source.
+func Anneal(state Annealable, maxTemp, minTemp float64, steps int, rnd *rand.Rand) Annealable {
 	factor := -math.Log(maxTemp / minTemp)
 	state = state.Copy()
 	bestState := state.Copy()
@@ -58,7 +73,7 @@ func Anneal(state Annealable, maxTemp, minTemp float64, steps int) Annealable {
 		undo := state.DoMove()
 		energy := state.Energy()
 		change := energy - previousEnergy
-		if change > 0 && math.Exp(-change/temp) < rand.Float64() {
+		if change > 0 && math.Exp(-change/temp) < rnd.Float64() {
 			state.UndoMove(undo)
 		} else {
 			previousEnergy = energy

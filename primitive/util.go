@@ -1,6 +1,7 @@
 package primitive
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -9,7 +10,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -31,37 +32,57 @@ func LoadImage(path string) (image.Image, error) {
 	}
 }
 
+// saveAtomic writes output to a temporary file in the destination directory
+// and renames it into place only after the write and close succeed. The
+// temporary file is removed on any failure, so an interrupted or failed
+// write never leaves a partial file behind and never clobbers an existing
+// output with a half-written one.
+func saveAtomic(path string, write func(w io.Writer) error) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".primitive-tmp-*")
+	if err != nil {
+		return fmt.Errorf("cannot create temporary file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	if err = write(tmp); err != nil {
+		return fmt.Errorf("cannot write %s: %w", path, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("cannot write %s: %w", path, err)
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("cannot move output into place at %s: %w", path, err)
+	}
+	return nil
+}
+
 func SaveFile(path, contents string) error {
 	if path == "-" {
 		_, err := fmt.Fprint(os.Stdout, contents)
 		return err
-	} else {
-		file, err := os.Create(path)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		_, err = file.WriteString(contents)
-		return err
 	}
+	return saveAtomic(path, func(w io.Writer) error {
+		_, err := io.WriteString(w, contents)
+		return err
+	})
 }
 
 func SavePNG(path string, im image.Image) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return png.Encode(file, im)
+	return saveAtomic(path, func(w io.Writer) error {
+		return png.Encode(w, im)
+	})
 }
 
 func SaveJPG(path string, im image.Image, quality int) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return jpeg.Encode(file, im, &jpeg.Options{quality})
+	return saveAtomic(path, func(w io.Writer) error {
+		return jpeg.Encode(w, im, &jpeg.Options{quality})
+	})
 }
 
 func SaveGIF(path string, frames []image.Image, delay, lastDelay int) error {
@@ -76,22 +97,26 @@ func SaveGIF(path string, frames []image.Image, delay, lastDelay int) error {
 			g.Delay = append(g.Delay, delay)
 		}
 	}
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return gif.EncodeAll(file, &g)
+	return saveAtomic(path, func(w io.Writer) error {
+		return gif.EncodeAll(w, &g)
+	})
 }
 
-func SaveGIFImageMagick(path string, frames []image.Image, delay, lastDelay int) error {
-	dir, err := ioutil.TempDir("", "")
+func SaveGIFImageMagick(ctx context.Context, path string, frames []image.Image, delay, lastDelay int) (err error) {
+	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err
 	}
+	// Always clean up the temporary frames, including on cancel and error.
+	defer os.RemoveAll(dir)
 	for i, im := range frames {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		path := filepath.Join(dir, fmt.Sprintf("%06d.png", i))
-		SavePNG(path, im)
+		if err := SavePNG(path, im); err != nil {
+			return err
+		}
 	}
 	args := []string{
 		"-loop", "0",
@@ -101,11 +126,11 @@ func SaveGIFImageMagick(path string, frames []image.Image, delay, lastDelay int)
 		filepath.Join(dir, fmt.Sprintf("%06d.png", len(frames)-1)),
 		path,
 	}
-	cmd := exec.Command("convert", args...)
+	cmd := exec.CommandContext(ctx, "convert", args...)
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	return os.RemoveAll(dir)
+	return nil
 }
 
 func NumberString(x float64) string {

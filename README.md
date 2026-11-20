@@ -44,9 +44,27 @@ Small input images should be used (like 256x256px). You don't need the detail an
 | `s` | 1024 | output image size |
 | `a` | 128 | color alpha (use `0` to let the algorithm choose alpha for each shape) |
 | `bg` | avg | starting background color (hex) |
-| `j` | 0 | number of parallel workers (default uses all cores) |
+| `j` | all cores | number of parallel workers (must be ≥ 1 when set; the worker count never changes the result) |
+| `seed` | -1 | random seed; `-1` picks a random seed and prints it to stderr so the run can be reproduced |
 | `v` | off | verbose output |
 | `vv` | off | very verbose output |
+
+### Determinism and Reproducibility
+
+Every run is fully determined by its input, flags and seed:
+
+- Each candidate search derives its own random stream from `(seed, step, job)`. No mutable random state is shared between goroutines, and the global `math/rand` source is never used by the search.
+- The winner among candidates is chosen by a deterministic ordering: lowest error, with exact ties broken by the stable shape encoding. Scan order and scheduling order cannot change the winner.
+- Changing `-j` only changes how candidates are distributed across cores, never which candidates exist. The same command with `-j 1` or `-j 16` produces byte-identical PNG and SVG output.
+
+To reproduce a run, reuse the seed printed to stderr:
+
+    primitive -i input.png -o output.png -n 100 -seed 12345
+    primitive -i input.png -o again.png -n 100 -seed 12345   # identical bytes
+
+### Cancellation and Output Atomicity
+
+Pressing Ctrl-C (or sending SIGTERM) cancels the run. Cancellation is checked during candidate search, shape mutation and frame writing, so the program stops promptly. Outputs are written atomically: data goes to a temporary file in the destination directory and is renamed into place only after the write succeeds. A cancelled or failed run therefore never leaves a half-written PNG or an invalid SVG behind, and a pre-existing output file is preserved. On exit the program reports which outputs were completed.
 
 ### Output Formats
 

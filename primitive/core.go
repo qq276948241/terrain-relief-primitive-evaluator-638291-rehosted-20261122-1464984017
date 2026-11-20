@@ -62,7 +62,21 @@ func drawLines(im *image.RGBA, c Color, lines []Scanline) {
 	}
 }
 
-func differenceFull(a, b *image.RGBA) float64 {
+// scoreToTotal converts an RMSE score back into the integer squared-error
+// total used internally. Kept for the compatibility wrappers below; the
+// model and workers carry the exact integer total instead of round-tripping
+// through a float64 score.
+func scoreToTotal(score float64, w, h int) uint64 {
+	return uint64(math.Pow(score*255, 2) * float64(w*h*4))
+}
+
+func totalToScore(total uint64, w, h int) float64 {
+	return math.Sqrt(float64(total)/float64(w*h*4)) / 255
+}
+
+// differenceFullTotal returns the exact sum of squared per-channel
+// differences between a and b.
+func differenceFullTotal(a, b *image.RGBA) uint64 {
 	size := a.Bounds().Size()
 	w, h := size.X, size.Y
 	var total uint64
@@ -85,13 +99,20 @@ func differenceFull(a, b *image.RGBA) float64 {
 			total += uint64(dr*dr + dg*dg + db*db + da*da)
 		}
 	}
-	return math.Sqrt(float64(total)/float64(w*h*4)) / 255
+	return total
 }
 
-func differencePartial(target, before, after *image.RGBA, score float64, lines []Scanline) float64 {
-	size := target.Bounds().Size()
-	w, h := size.X, size.Y
-	total := uint64(math.Pow(score*255, 2) * float64(w*h*4))
+func differenceFull(a, b *image.RGBA) float64 {
+	size := a.Bounds().Size()
+	return totalToScore(differenceFullTotal(a, b), size.X, size.Y)
+}
+
+// differencePartialTotal incrementally updates the squared-error total:
+// pixels covered by lines are moved from their "before" contribution to
+// their "after" contribution. Pixels outside lines are untouched, so their
+// contribution carries over exactly. The lines must not cover any pixel
+// more than once (all rasterizers in this package satisfy that).
+func differencePartialTotal(target, before, after *image.RGBA, total uint64, lines []Scanline) uint64 {
 	for _, line := range lines {
 		i := target.PixOffset(line.X1, line.Y)
 		for x := line.X1; x <= line.X2; x++ {
@@ -120,5 +141,15 @@ func differencePartial(target, before, after *image.RGBA, score float64, lines [
 			total += uint64(dr2*dr2 + dg2*dg2 + db2*db2 + da2*da2)
 		}
 	}
-	return math.Sqrt(float64(total)/float64(w*h*4)) / 255
+	return total
+}
+
+// differencePartial is kept for API compatibility. Prefer carrying the
+// integer total (differenceFullTotal / differencePartialTotal) to avoid
+// float round-trip error.
+func differencePartial(target, before, after *image.RGBA, score float64, lines []Scanline) float64 {
+	size := target.Bounds().Size()
+	w, h := size.X, size.Y
+	total := differencePartialTotal(target, before, after, scoreToTotal(score, w, h), lines)
+	return totalToScore(total, w, h)
 }
